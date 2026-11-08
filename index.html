@@ -227,11 +227,19 @@ addEventListener('resize', resize); resize();
 
 
 // ---------- 소리 ----------
+const MASTER_VOL = 1.0;
+let echoIn = null;
 let AC = null, master = null, windGain = null, muted = false;
 function initAudio() {
   if (AC) { AC.resume(); return; }
   AC = new (window.AudioContext || window.webkitAudioContext)();
-  master = AC.createGain(); master.gain.value = 0.9; master.connect(AC.destination);
+  const comp = AC.createDynamicsCompressor(); comp.threshold.value = -18; comp.knee.value = 6; comp.ratio.value = 4; comp.attack.value = 0.003; comp.release.value = 0.2;
+  const boost = AC.createGain(); boost.gain.value = 1.8;
+  master = AC.createGain(); master.gain.value = MASTER_VOL; master.connect(comp).connect(boost).connect(AC.destination);
+  // 메아리 (지연 + 되울림)
+  echoIn = AC.createGain(); const dl = AC.createDelay(2); dl.delayTime.value = 0.42;
+  const fb = AC.createGain(); fb.gain.value = 0.55; const lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 2400;
+  echoIn.connect(dl); dl.connect(lp); lp.connect(fb); fb.connect(dl); lp.connect(master);
   // 바람·대나무 스치는 소리 (걸러낸 잡음)
   const len = AC.sampleRate * 2, nb = AC.createBuffer(1, len, AC.sampleRate), d = nb.getChannelData(0);
   let last = 0; for (let i = 0; i < len; i++) { last = (last + 0.02 * (Math.random() * 2 - 1)) / 1.02; d[i] = last * 3.5; }
@@ -249,9 +257,9 @@ function tone(f, d, dur, vol = 0.22, type = 'sine', f2) {
   o.connect(g).connect(master); o.start(t0); o.stop(t0 + dur + 0.05);
 }
 function chirp() { const b = 2600 + Math.random() * 1200; tone(b, 0, 0.12, 0.05, 'sine', b * 1.4); tone(b * 1.1, 0.16, 0.1, 0.04, 'sine', b * 1.5); }
-function playDing() { tone(880, 0, 0.45, 0.28); tone(1320, 0.12, 0.6, 0.28); tone(1760, 0.26, 0.7, 0.18); }
+function playDing() { tone(880, 0, 0.45, 0.45); tone(1320, 0.12, 0.6, 0.45); tone(1760, 0.26, 0.7, 0.3); }
 function playWrong() { tone(330, 0, 0.18, 0.18, 'triangle'); tone(247, 0.16, 0.3, 0.18, 'triangle'); }
-function playGrow() { [523, 659, 784, 1047].forEach((f, i) => tone(f, i * 0.09, 0.4, 0.2, 'triangle')); }
+function playGrow() { [523, 659, 784, 1047].forEach((f, i) => tone(f, i * 0.09, 0.4, 0.35, 'triangle')); }
 let stepCd = 0;
 function playStep() { tone(180 + Math.random() * 40, 0, 0.08, 0.06, 'triangle', 120); }
 // 숲이 문장을 메아리로 읽어 줌
@@ -270,25 +278,116 @@ if ('speechSynthesis' in window) speechSynthesis.getVoices();
 
 // ---------- 소리 (마이크) ----------
 let analyser = null, buf = null, level = 0, keyShout = false;
+let micFloor = 0.01, micStream = null, rec = null, recChunks = [], recDone = null;
 async function initMic() {
+  const st = document.getElementById('micState');
+  if (!window.isSecureContext || !navigator.mediaDevices) { st.textContent = '🎤 https 주소에서만 마이크를 쓸 수 있습니다 · 스페이스바를 눌러 외쳐보세요!'; return; }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const src = ctx.createMediaStreamSource(stream);
-    analyser = ctx.createAnalyser(); analyser.fftSize = 1024; buf = new Float32Array(analyser.fftSize);
-    src.connect(analyser);
-    document.getElementById('micState').textContent = '🎤 마이크 연결됨';
+    micStream = stream;
+    initAudio(); await AC.resume();                       // 시작 버튼에서 켠 오디오를 같이 씀 (사파리에서 새로 만들면 멈춘 채로 시작됨)
+    const src = AC.createMediaStreamSource(stream);
+    analyser = AC.createAnalyser(); analyser.fftSize = 1024; buf = new Float32Array(analyser.fftSize);
+    src.connect(analyser);                                // 스피커로는 보내지 않음
+    st.textContent = '🎤 마이크 연결됨';
   } catch (e) {
-    document.getElementById('micState').textContent = '🎤 마이크 없음 · 스페이스바를 눌러 외쳐보세요!';
+    st.textContent = e && e.name === 'NotAllowedError'
+      ? '🎤 마이크 권한이 꺼져 있습니다 · 주소창 왼쪽 아이콘에서 마이크를 허용한 뒤 새로고침해 주세요 (그전엔 스페이스바를 눌러 외쳐보세요!)'
+      : '🎤 마이크를 찾지 못했습니다 · 스페이스바를 눌러 외쳐보세요!';
   }
 }
-addEventListener('keydown', e => { if (e.code === 'Space' && document.activeElement.tagName !== 'TEXTAREA') { keyShout = true; e.preventDefault(); } });
-addEventListener('keyup', e => { if (e.code === 'Space') keyShout = false; });
+addEventListener('keydown', e => { if (e.code === 'Space' && document.activeElement.tagName !== 'TEXTAREA') { e.preventDefault(); if (!e.repeat) spaceShout(); } });
 function readLevel() {
   let v = 0;
-  if (analyser) { analyser.getFloatTimeDomainData(buf); let s = 0; for (const x of buf) s += x * x; v = Math.min(1, Math.sqrt(s / buf.length) * 6); }
-  if (keyShout) v = Math.max(v, 0.85 + Math.random() * 0.15);
+  if (analyser) {
+    analyser.getFloatTimeDomainData(buf); let s = 0; for (const x of buf) s += x * x;
+    const rms = Math.sqrt(s / buf.length);
+    micFloor = rms < micFloor ? rms : micFloor + (rms - micFloor) * 0.002;   // 방 소음 수준을 천천히 따라감
+    v = Math.max(0, Math.min(1, (rms - micFloor) * 16));
+  }
+  if (yahoT > 0) v = Math.max(v, 0.85 + Math.random() * 0.15);
   level += (v - level) * 0.25; return level;
+}
+
+
+// ---------- 내 목소리 메아리 ----------
+// 외치기 시작하면 녹음 → 게이지가 차면 멈추고 → 숲 메아리(지연 + 되울림)로 다시 들려줌
+function startRec() {
+  if (!micStream || rec || !window.MediaRecorder) return;
+  try {
+    const r = new MediaRecorder(micStream), chunks = []; recChunks = chunks;
+    r.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+    recDone = new Promise(res => { r.onstop = () => res(new Blob(chunks, { type: r.mimeType })); });
+    r.start(); rec = r;
+  } catch (e) { rec = null; }
+}
+async function stopRecAndEcho() {
+  if (!rec) return false;
+  const r = rec; rec = null;
+  try {
+    r.stop(); const blob = await recDone;
+    const ab = await AC.decodeAudioData(await blob.arrayBuffer());
+    playVoiceEcho(ab); return true;
+  } catch (e) { return false; }
+}
+function playVoiceEcho(ab) {
+  if (muted) return;
+  const t0 = AC.currentTime + 0.25;
+  // 원래 목소리 + 메아리 3번 (점점 작고 멀게)
+  [[0, 0.9, 20000], [0.45, 0.5, 3200], [0.9, 0.28, 2200], [1.35, 0.15, 1500]].forEach(([d, vol, cut]) => {
+    const s = AC.createBufferSource(); s.buffer = ab;
+    const lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = cut;
+    const g = AC.createGain(); g.gain.value = vol;
+    s.connect(lp).connect(g).connect(master); s.start(t0 + d);
+  });
+  return ab.duration;
+}
+
+
+// ---------- 스페이스바 외침: "야~호~" + 메아리 ----------
+function playYaho() {
+  if (!AC || muted) return;
+  const t0 = AC.currentTime + 0.01, T = 1.25;
+  const voice = AC.createGain(); voice.gain.value = 0;
+  voice.connect(master); voice.connect(echoIn);
+  // 성대: 톱니파 + 살짝 떨림
+  const osc = AC.createOscillator(); osc.type = 'sawtooth';
+  const pitch = 1 + Math.random() * 0.08;
+  osc.frequency.setValueAtTime(420 * pitch, t0);
+  osc.frequency.linearRampToValueAtTime(520 * pitch, t0 + 0.3);   // 야↗
+  osc.frequency.linearRampToValueAtTime(560 * pitch, t0 + 0.42);  // 호 시작
+  osc.frequency.linearRampToValueAtTime(430 * pitch, t0 + T);     // 호~↘
+  const vib = AC.createOscillator(), vibG = AC.createGain(); vib.frequency.value = 6; vibG.gain.value = 9;
+  vib.connect(vibG).connect(osc.frequency);
+  // 입 모양: 모음 필터 3개 (야 → 호 → 우)
+  const F = [[300, 800, 500, 380], [2200, 1250, 850, 700], [2900, 2600, 2500, 2400]];
+  const Q = [9, 11, 13], V = [1, 0.6, 0.25];
+  F.forEach((f, i) => {
+    const bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = Q[i];
+    bp.frequency.setValueAtTime(f[0], t0); bp.frequency.linearRampToValueAtTime(f[1], t0 + 0.12);
+    bp.frequency.setValueAtTime(f[1], t0 + 0.32); bp.frequency.linearRampToValueAtTime(f[2], t0 + 0.5);
+    bp.frequency.linearRampToValueAtTime(f[3], t0 + T);
+    const g = AC.createGain(); g.gain.value = V[i] * 2; osc.connect(bp).connect(g).connect(voice);
+  });
+  // ㅎ 바람 소리
+  const nb = AC.createBuffer(1, AC.sampleRate * 0.15, AC.sampleRate), d = nb.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  const ns = AC.createBufferSource(); ns.buffer = nb; const nf = AC.createBiquadFilter(); nf.type = 'bandpass'; nf.frequency.value = 1500; nf.Q.value = 0.8;
+  const ng = AC.createGain(); ng.gain.setValueAtTime(0, t0 + 0.3); ng.gain.linearRampToValueAtTime(0.5, t0 + 0.36); ng.gain.linearRampToValueAtTime(0, t0 + 0.44);
+  ns.connect(nf).connect(ng).connect(voice);
+  // 크기: 야 / (ㅎ에서 살짝 줄고) / 호~ 길게
+  const v = voice.gain;
+  v.setValueAtTime(0, t0); v.linearRampToValueAtTime(1, t0 + 0.04); v.setValueAtTime(1, t0 + 0.28);
+  v.linearRampToValueAtTime(0.35, t0 + 0.36); v.linearRampToValueAtTime(1, t0 + 0.46);
+  v.setValueAtTime(1, t0 + T - 0.35); v.linearRampToValueAtTime(0, t0 + T);
+  osc.start(t0); vib.start(t0); ns.start(t0 + 0.3); osc.stop(t0 + T + 0.05); vib.stop(t0 + T + 0.05);
+}
+let yahoT = 0;
+function spaceShout() {
+  if (phase !== 'shout' && phase !== 'done') return;
+  initAudio(); playYaho(); yahoT = 1.2;
+  for (let i = 0; i < 4; i++) setTimeout(() => spawnWave(1), i * 120);
+  if (phase === 'shout' && onSpot()) { shoutFill = 1; }
 }
 
 // ---------- 게임 흐름 ----------
@@ -332,7 +431,9 @@ $('next').addEventListener('click', () => { qi++; showQuestion(); });
 
 function finishShout() {
   phase = 'done'; spot.visible = false; grown = Math.min(GOAL, grown + 1);
-  myGrove[grown - 1].userData.target = 1; playGrow(); setTimeout(() => speakEcho(QUESTIONS[qi % QUESTIONS.length].show), 500);
+  myGrove[grown - 1].userData.target = 1; playGrow();
+  const sentence = QUESTIONS[qi % QUESTIONS.length].show;
+  stopRecAndEcho().then(ok => setTimeout(() => speakEcho(sentence), ok ? 3200 : 500));
   $('count').textContent = `🎋 ${grown} / ${GOAL}`;
   const q = QUESTIONS[qi % QUESTIONS.length];
   const tail = q.show.replace(/[.,]/g, '').split(' ').slice(-2).join(' ');
@@ -423,19 +524,20 @@ function updateCelebrate(dt) {
   }
 }
 
-$('mute').addEventListener('click', () => { muted = !muted; if (master) master.gain.value = muted ? 0 : 0.9; if (muted && 'speechSynthesis' in window) speechSynthesis.cancel(); $('mute').textContent = muted ? '🔇' : '🔊'; });
+$('mute').addEventListener('click', () => { muted = !muted; if (master) master.gain.value = muted ? 0 : MASTER_VOL; if (muted && 'speechSynthesis' in window) speechSynthesis.cancel(); $('mute').textContent = muted ? '🔇' : '🔊'; });
 // ---------- 루프 ----------
 const clock = new THREE.Clock();
 let camA = 0;
 function loop() {
   const dt = Math.min(clock.getDelta(), 0.05), t = clock.elapsedTime;
+  yahoT = Math.max(0, yahoT - dt);
   const lv = phase === 'shout' || phase === 'done' ? readLevel() : 0;
   if (phase === 'shout') {
     $('meterFill').style.height = (lv * 100).toFixed(0) + '%';
     const here = onSpot();
-    if (here && lv > 0.45) { shoutFill += dt / 1.2; if (Math.random() < 0.25) spawnWave(lv); }
+    if (here && lv > 0.4) { if (analyser && yahoT <= 0) startRec(); shoutFill += dt / 1.2; if (Math.random() < 0.25) spawnWave(lv); }
     else shoutFill = Math.max(0, shoutFill - dt * 0.3);
-    if (!here) $('shoutMsg').textContent = '빛나는 자리로 걸어가서 크게 외쳐 봅시다! (방향키 · 화면 누르기)';
+    if (!here) $('shoutMsg').textContent = yahoT > 0 ? '빛나는 자리에서 외쳐야 대나무가 자랍니다!' : '빛나는 자리로 걸어가서 크게 외쳐 봅시다! (방향키 · 화면 누르기)';
     else if (shoutFill < 0.05) $('shoutMsg').textContent = '좋습니다! 이제 문장을 크게 외쳐 봅시다!';
     $('fillBar').style.width = (Math.min(1, shoutFill) * 100).toFixed(0) + '%';
     if (shoutFill >= 1) finishShout();
